@@ -344,7 +344,7 @@ Micro-batch sits between the two and covers most **"near real-time"** needs. Pic
 
 2. **Stream Processing:** Stream processing handles data in real-time as it arrives from sources. Instead of waiting for a batch, data is processed continuously, enabling instant analysis and reactions to events, ideal for real-time analytics and alerts.
 
-3. **Lambda Architecture (Batch + Stream):** It is popular in data engineering because it offers the best of both worlds: real-time insights from streaming and comprehensive historical analysis from batch processing. Data is processed as soon as it arrives, while also being stored for later analysis. It is a batch processing system supplemented by a real-time stream, meaning both real-time and historical data are handled by using the same principles of batch processing (windowing, aggregation, filtering) but applied to streams in real time.
+3. **Lambda Architecture (Batch + Stream):** Lambda architecture is a way of processing massive quantities of data (i.e. "Big Data") that provides access to batch-processing and stream-processing methods with a hybrid approach. Lambda architecture is used to solve the problem of computing arbitrary functions. The lambda architecture itself is composed of 3 layers: Batch, Speed(Streaming) and Serving.
 
 ![Lambda Architecture](Images/Lambda1.png)
 
