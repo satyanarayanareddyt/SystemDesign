@@ -396,6 +396,34 @@ Micro-batch sits between the two and covers most **"near real-time"** needs. Pic
 | 101 | T001 | MAQ | 2024-01-01 | 2026-07-01 | false |
 | 102 | T001 | MAQ Software | 2026-07-01 | 9999-12-31 | true |
 
+### ETL vs. ELT
+
+Both patterns move data from source to target, but they differ in **where** and **when** the transformation happens.
+
+1. **ETL (Extract → Transform → Load):** Data is extracted from the source, transformed by an **external engine** (Spark, Informatica, SSIS), and only the transformed result is loaded into the target. Raw data is typically discarded. Common in legacy on-prem data warehouses.
+
+2. **ELT (Extract → Load → Transform):** Data is extracted and loaded **as-is (raw)** into the target, and transformations run **inside the warehouse/lakehouse** using its native compute (SQL, dbt, Databricks). Raw data is preserved for reprocessing. This is the **modern default** for cloud data platforms.
+
+#### ETL vs. ELT — Trade-off
+
+| Aspect | **ETL** (Extract → Transform → Load) | **ELT** (Extract → Load → Transform) |
+|---|---|---|
+| Order of operations | Transform *before* loading into target | Load raw first, transform *inside* target |
+| Where transformation runs | External engine (Spark, Informatica, SSIS) | Target warehouse/lakehouse (SQL, dbt) |
+| Raw data availability | Usually discarded after transform | Always kept in raw/Bronze layer |
+| Compute cost | Separate ETL cluster | Uses warehouse compute (Snowflake, BigQuery, Databricks SQL) |
+| Storage cost | Lower (only curated data stored) | Higher (raw + curated stored) |
+| Speed to load | Slower (transform is a bottleneck) | Faster (raw lands immediately) |
+| Schema handling | Schema-on-write (rigid) | Schema-on-read (flexible) |
+| Reprocessing | Hard — raw is gone | Easy — re-run SQL on raw |
+| Best suited for | Small/medium data, complex transforms, on-prem DWs | Cloud warehouses & lakehouses, large volumes |
+| Typical tools | Informatica, SSIS, Talend, Spark (transform-heavy) | dbt, Snowflake, BigQuery, Databricks, Fabric |
+| When to choose | Legacy systems, strict governance, PII masking before load | Modern cloud stacks, big data, agile analytics |
+
+> **Note:** The **Medallion architecture (Bronze → Silver → Gold)** is fundamentally an **ELT pattern** — raw data lands in Bronze, then transforms run downstream inside the lakehouse.
+
+**One-line summary:** **ETL** transforms *before* loading (external compute, no raw kept). **ELT** loads raw first, then transforms *inside* the warehouse/lakehouse (cheaper storage compute, keeps raw, easier reprocessing). **Modern cloud stacks default to ELT.**
+
 ### Data Ingestion Patterns
 
 1. **Push-based Ingestion:** In push-based ingestion, data is collected over time and processed in batches at scheduled intervals. This pattern is suitable for large volumes of data that don't require immediate processing.
