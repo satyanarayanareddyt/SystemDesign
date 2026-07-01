@@ -378,24 +378,6 @@ Micro-batch sits between the two and covers most **"near real-time"** needs. Pic
 
 3. **Change Data Capture (CDC):** Is a method used to identify and capture changes (inserts, updates and deletes) made to data in a source database, allowing these changes to be efficiently propagated to other systems, such as data warehouses, data lakes, or downstream applications. CDC helps in maintaining data consistency and enabling real-time or near-real-time data integration, minimizing data transfer and processing time.
 
-#### SCD Types
-
-| SCD Type | Name | Description | Example |
-|---|---|---|---|
-| **Type 0** | Retain Original | Value is fixed at creation and **never updated**, regardless of source changes. | `date_of_birth` — never changes even if source is corrected |
-| **Type 1** | Overwrite Existing Data | Existing data is updated with new values. The previous data is **overwritten** and only the most recent value is retained. Suitable when historical tracking is not required. | Tenant name changes from **"MAQ"** to **"MAQ Software"** — the old row is **replaced** by the new one. |
-| **Type 2** | Preserving Historical Versions | A **new row** is inserted for every change, preserving full history. Tracked via metadata columns (`start_date`, `end_date`, `is_current`). Ideal when time-based analysis is needed. | For tenant **"MAQ"** changed to **"MAQ Software"** — the old row is closed (`is_current = false`, `end_date = today`) and a new row is inserted (`start_date = today`, `is_current = true`). Both versions coexist. |
-| **Type 3** | Track Limited History | Adds **extra columns** (e.g., `previous_value`, `current_value`) to store the prior value alongside the current one. Only the last N versions are kept. | A `current_tenant_name` and `previous_tenant_name` column both exist on the same row. |
-| **Type 4** | History Table | The main dimension table holds only the **current value**, while a **separate history table** stores all past versions. | `dim_tenant` has the current name; `dim_tenant_history` has every past name with timestamps. |
-| **Type 6** | Hybrid (1 + 2 + 3) | Combines Types 1, 2, and 3. | Latest name shown on every row, plus historical rows with effective date ranges. |
-
-**Example SCD Type 2 rows after a name change:**
-
-| tenant_sk | tenant_id | tenant_name | start_date | end_date | is_current |
-|---|---|---|---|---|---|
-| 101 | T001 | MAQ | 2024-01-01 | 2026-07-01 | false |
-| 102 | T001 | MAQ Software | 2026-07-01 | 9999-12-31 | true |
-
 ### ETL vs. ELT
 
 Both patterns move data from source to target, but they differ in **where** and **when** the transformation happens.
@@ -426,7 +408,7 @@ Both patterns move data from source to target, but they differ in **where** and 
 
 ### Data Ingestion Patterns
 
-1. **Push-based Ingestion:** In push-based ingestion, data is collected over time and processed in batches at scheduled intervals. This pattern is suitable for large volumes of data that don't require immediate processing.
+1. **Push-based Ingestion:** Source system initiates delivery of data to the consumer without explicit requests. Common examples include Event Hub, Kafka, webhooks, telemetry streams, and IoT devices.
 
 2. **Pull-based Ingestion:** Pull-based ingestion is controlled by your platform. You initiate the import process, requesting data from the source at regular intervals or on-demand. **Trade-offs:** Must handle duplicates, risk of missed events, requires explicit requests, requires monitoring.
 
@@ -452,6 +434,23 @@ Both patterns move data from source to target, but they differ in **where** and 
 ## Step 3 — Data Modeling
 
 *Coming next: Medallion, Star, OBT, SCD deep dive.*
+### SCD Types
+
+| SCD Type | Name | Description | Example |
+|---|---|---|---|
+| **Type 0** | Retain Original | Value is fixed at creation and **never updated**, regardless of source changes. | `date_of_birth` — never changes even if source is corrected |
+| **Type 1** | Overwrite Existing Data | Existing data is updated with new values. The previous data is **overwritten** and only the most recent value is retained. Suitable when historical tracking is not required. | Tenant name changes from **"MAQ"** to **"MAQ Software"** — the old row is **replaced** by the new one. |
+| **Type 2** | Preserving Historical Versions | A **new row** is inserted for every change, preserving full history. Tracked via metadata columns (`start_date`, `end_date`, `is_current`). Ideal when time-based analysis is needed. | For tenant **"MAQ"** changed to **"MAQ Software"** — the old row is closed (`is_current = false`, `end_date = today`) and a new row is inserted (`start_date = today`, `is_current = true`). Both versions coexist. |
+| **Type 3** | Track Limited History | Adds **extra columns** (e.g., `previous_value`, `current_value`) to store the prior value alongside the current one. Only the last N versions are kept. | A `current_tenant_name` and `previous_tenant_name` column both exist on the same row. |
+| **Type 4** | History Table | The main dimension table holds only the **current value**, while a **separate history table** stores all past versions. | `dim_tenant` has the current name; `dim_tenant_history` has every past name with timestamps. |
+| **Type 6** | Hybrid (1 + 2 + 3) | Combines Types 1, 2, and 3. | Latest name shown on every row, plus historical rows with effective date ranges. |
+
+**Example SCD Type 2 rows after a name change:**
+
+| tenant_sk | tenant_id | tenant_name | start_date | end_date | is_current |
+|---|---|---|---|---|---|
+| 101 | T001 | MAQ | 2024-01-01 | 2026-07-01 | false |
+| 102 | T001 | MAQ Software | 2026-07-01 | 9999-12-31 | true |
 
 ---
 
