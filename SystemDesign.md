@@ -354,21 +354,34 @@ Micro-batch sits between the two and covers most **"near real-time"** needs. Pic
 
 ![Kappa Architecture](Images/Kappa.png)
 
-### Lambda vs. Kappa — Trade-off
+5. **Delta Architecture (Unified Batch + Streaming):** A modern alternative to Lambda, popularized by Databricks. It uses **Delta Lake's ACID transactions** to let the *same pipeline* handle both batch and streaming workloads through the **same tables** — eliminating Lambda's dual-codebase problem. The Medallion layers (Bronze → Silver → Gold) are typically implemented as Delta tables, with streaming and batch jobs reading and writing to the same target. Best when you're already on Delta Lake / Databricks / Fabric and want unified real-time + historical processing without dual maintenance.
 
-| Dimension | **Lambda** | **Kappa** |
-|---|---|---|
-| Pipelines | Two (batch + streaming) | One (streaming) |
-| Codebases | Two — must stay in sync | One |
-| Real-time freshness | ✅ Yes (via speed layer) | ✅ Yes (native) |
-| Historical accuracy | ✅ High (batch is source of truth) | ✅ High (via replay) |
-| Complexity | High (dual maintenance) | Medium (streaming expertise required) |
-| Cost | Higher (two systems) | Lower to medium |
-| Backfills | Easy (batch layer) | Slower (replay from log) |
-| Late-arriving data | Corrected by batch layer | Handled via watermarks + replay |
-| Storage requirement | Data lake + streaming buffer | Long-retention log (Kafka tiered storage) |
-| Team skill | Batch + streaming both | Streaming-focused |
-| Best for | Mixed batch/real-time SLAs, mature orgs | Streaming-native use cases |
+```
+Streaming source ────┐
+                   ├──▶ Bronze (Delta) ──▶ Silver (Delta) ──▶ Gold (Delta) ──▶ Serving
+Batch source ───────┘        │                  │                  │
+                            └── same Delta tables serve both streaming & batch reads/writes
+                                (ACID + MERGE + streaming APIs + time travel)
+```
+
+### Lambda vs. Kappa vs. Delta — Trade-off
+
+| Dimension | **Lambda** | **Kappa** | **Delta Architecture** |
+|---|---|---|---|
+| Pipelines | Two (batch + streaming) | One (streaming) | **One unified (Delta tables)** |
+| Codebases | Two — must stay in sync | One | **One** |
+| Batch support | Native | Via replay | **Native** |
+| Streaming support | Native | Native | **Native** |
+| Real-time freshness | ✅ (via speed layer) | ✅ (native) | ✅ (streaming writes) |
+| Historical accuracy | ✅ High (batch is source of truth) | ✅ High (via replay) | ✅ High (time travel) |
+| Complexity | High (dual maintenance) | Medium (streaming expertise) | **Low to medium** |
+| Cost | Higher (two systems) | Lower to medium | **Lower (single stack)** |
+| Backfills | Easy (batch layer) | Slower (replay from log) | **Easy (re-run on Delta)** |
+| Late-arriving data | Corrected by batch layer | Watermarks + replay | **MERGE handles late records** |
+| Storage foundation | Any (HDFS, S3) | Kafka + any | **Delta Lake (ACID)** |
+| Reprocessing | Re-run batch layer | Kafka replay | **Just re-run on Delta** |
+| Vendor coupling | Low | Low–medium | **Delta / Databricks (opening via UniForm & OSS Delta)** |
+| Best for | Mixed batch/real-time SLAs, mature orgs | Streaming-native use cases | **Modern lakehouse platforms (Databricks, Fabric)** |
 
 ### Full Load vs. Incremental vs. CDC
 
@@ -408,7 +421,7 @@ Both patterns move data from source to target, but they differ in **where** and 
 
 ### Data Ingestion Patterns
 
-1. **Push-based Ingestion:** Source system initiates delivery of data to the consumer without explicit requests. Common examples include Event Hub, Kafka, webhooks, telemetry streams, and IoT devices.
+1. **Push-based Ingestion:** In push-based ingestion, data is collected over time and processed in batches at scheduled intervals. This pattern is suitable for large volumes of data that don't require immediate processing.
 
 2. **Pull-based Ingestion:** Pull-based ingestion is controlled by your platform. You initiate the import process, requesting data from the source at regular intervals or on-demand. **Trade-offs:** Must handle duplicates, risk of missed events, requires explicit requests, requires monitoring.
 
@@ -433,8 +446,11 @@ Both patterns move data from source to target, but they differ in **where** and 
 
 ## Step 3 — Data Modeling
 
-*Coming next: Medallion, Star, OBT, SCD deep dive.*
-### SCD Types
+*Coming next: Medallion, Star, OBT deep dive.*
+
+### Slowly Changing Dimensions (SCD)
+
+SCD patterns define **how changes to dimension attributes are tracked over time**. Choosing the right SCD type is a core data modeling decision — it determines whether history is preserved, overwritten, or partially retained.
 
 | SCD Type | Name | Description | Example |
 |---|---|---|---|
@@ -451,6 +467,8 @@ Both patterns move data from source to target, but they differ in **where** and 
 |---|---|---|---|---|---|
 | 101 | T001 | MAQ | 2024-01-01 | 2026-07-01 | false |
 | 102 | T001 | MAQ Software | 2026-07-01 | 9999-12-31 | true |
+
+> **In practice, Type 1 and Type 2 cover ~95% of real-world use cases.** Type 2 is the default when history matters.
 
 ---
 
