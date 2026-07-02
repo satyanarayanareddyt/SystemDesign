@@ -446,7 +446,17 @@ Both patterns move data from source to target, but they differ in **where** and 
 
 ## Step 3 — Data Modeling
 
-*Coming next: Medallion, Star, OBT deep dive.*
+### Medallion Architecture
+
+![Medallion Architecture](Images/Medallion.png)
+
+---
+
+### Star Schema Vs Denormalization
+
+![StartVsDenormalization](Images/StarVsDenormalization.png)
+
+---
 
 ### Slowly Changing Dimensions (SCD)
 
