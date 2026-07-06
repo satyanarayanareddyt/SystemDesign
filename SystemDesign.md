@@ -611,6 +611,82 @@ These aren't file formats themselves — they're **transactional table formats**
 
 ## Step 5 — Data Quality & Observability
 
+Once the pipeline runs, the next question is: **can we trust the data, and can we see what's happening inside the pipeline?** These are two different problems:
+
+- **Data Quality (DQ)** — *is the data itself correct?* (values, freshness, completeness)
+- **Observability** — *is the pipeline itself healthy?* (runs, latency, failures, lineage)
+
+You need both. A pipeline can run "green" (no job failures) while quietly producing garbage data — and vice versa.
+
+### DQ Dimensions
+
+Data quality isn't a single metric — it's measured across **six standard dimensions**. Every DQ check you write maps to one of these.
+
+| # | Dimension | Question it answers | Example check |
+|---|---|---|---|
+| 1 | **Accuracy** | Does the data match reality? | Order totals in Silver match the source system totals |
+| 2 | **Completeness** | Is any expected data missing? | `null` rate on `user_id` is 0%; row count today ≥ 95% of 7-day avg |
+| 3 | **Consistency** | Does the same fact agree across systems / tables? | `revenue` in Gold matches `SUM(revenue)` in Silver |
+| 4 | **Timeliness (Freshness)** | Is the data recent enough for its SLA? | Latest `event_time` in Bronze is within 90 minutes |
+| 5 | **Uniqueness** | Are there duplicates where there shouldn't be? | `order_id` is unique in `fact_orders` |
+| 6 | **Validity** | Do values conform to defined rules / ranges / types? | `revenue >= 0`; `country_code IN ('US','IN','GB',…)`; `email` matches regex or KPI Drift or Row Count drift|
+| 7 | **Schema Drift** | Validate schema between source and our system | |
+
+**Where DQ checks run in the Medallion architecture:**
+
+| Layer | Typical DQ focus |
+|---|---|
+| **Bronze** | Ingestion-level — schema conformance, row-count sanity, freshness of source pull |
+| **Silver** | Transformation-level — uniqueness, referential integrity, null constraints, business rules |
+| **Gold** | Business-level — metric reconciliation, cross-system consistency, YoY reasonableness |
+
+**Common tools:** Great Expectations, Soda, dbt tests, Databricks DLT expectations, Delta constraints (`CHECK`, `NOT NULL`), Fabric Data Wrangler.
+
+**Actioning failures — three tiers:**
+
+1. **Warn** — log and continue (e.g., minor null rate breach on non-critical column).
+2. **Quarantine** — write bad rows to a `_rejected` table, continue with clean rows.
+3. **Fail (halt pipeline)** — stop processing immediately (e.g., duplicate primary keys, source row count dropped >50%).
+
+Choose per-check based on **blast radius**, not uniformly.
+
+---
+
+### Data Contracts
+
+A **data contract** is an *explicit, versioned agreement* between a data **producer** (upstream team / source system) and a data **consumer** (your pipeline / downstream users) about **what the data will look like and behave like**.
+
+It flips the traditional model — instead of consumers discovering breakages *after* production incidents, producers commit to a contract *before* releasing changes.
+
+**What a contract typically declares:**
+
+| Element | Example |
+|---|---|
+| **Schema** | Column names, types, nullability |
+| **Semantics** | `revenue` is in USD, gross, excludes refunds |
+| **SLA — Freshness** | Data lands in Bronze within 60 minutes of event time |
+| **SLA — Availability** | 99.9% uptime for the source API |
+| **Volume expectations** | Between 200M–300M events/day |
+| **Allowed changes** | Additive-only; breaking changes require 30-day notice |
+| **Ownership** | Producer team + on-call contact |
+| **Versioning** | `v1.2` → `v2.0` for breaking changes |
+
+**Typical formats:** YAML or JSON files stored in Git alongside the producer's code — e.g., `contracts/portal-telemetry-v1.yaml`.
+
+**Enforcement points:**
+
+- **CI/CD** — reject producer PRs that break the contract schema
+- **Ingestion** — validate incoming payload against the contract (schema registry, Avro/Protobuf)
+- **Runtime** — DQ checks in Bronze verify contract expectations (row counts, freshness, value ranges)
+
+**Why contracts matter:** they shift DQ **left** — problems get caught at the producer boundary, not 5 hops downstream in a broken dashboard.
+
+**Common tools:** Confluent Schema Registry, Protobuf/Avro schemas, Great Expectations suites, dbt sources, Datahub / OpenMetadata contract definitions.
+
+---
+
+### Pipeline Observability
+
 Observability answers: *"What is the pipeline doing right now, and what did it do yesterday?"* It's built on **three pillars** — the same as for microservices, adapted to data.
 
 | Pillar | For data pipelines, this means… |
@@ -649,6 +725,389 @@ Observability answers: *"What is the pipeline doing right now, and what did it d
 
 ---
 
-## Step 6 — Scalability, Backfill & DataOps
+## Step 6 — Pipeline Resilence
 
-*Coming next: Idempotency, Backfills, Schema Evolution.*
+Pipelines will fail — jobs crash, clusters die, source APIs time out, deploys go bad. **Resilience is how gracefully the pipeline recovers.** The three pillars are **idempotency**, **backfills**, and **schema evolution**.
+
+### Idempotency
+
+**Definition:** An operation is **idempotent** if running it *N* times produces the **same result** as running it *once*.
+
+$$
+f(x) = f(f(x)) = f(f(f(x))) \;\;=\; \text{same output}
+$$
+
+In data engineering, this means: **re-running a job (or a partition) must not produce duplicates, double-counted metrics, or corrupted state.**
+
+#### Why it matters
+
+Every real pipeline gets re-run — because of retries, backfills, late data, deploys, or human error. Without idempotency, every re-run risks **data corruption**.
+
+| Scenario | Non-idempotent pipeline | Idempotent pipeline |
+|---|---|---|
+| Job fails at 90% and retries | Duplicate rows for the 90% already written | Same final state — retries are safe |
+| Backfill re-runs yesterday's partition | Yesterday's data doubles | Yesterday's data is overwritten cleanly |
+| Late-arriving events for a closed day | Appended → duplicated | Merged → replaced or upserted |
+| Deploy pushes buggy transform, then fix | Bad rows linger forever | Re-run the fix, state is corrected |
+
+**Rule of thumb:** *If you can't safely re-run a job, you don't have a pipeline — you have a landmine.*
+
+#### The 4 core patterns
+
+##### 1. Overwrite by partition (simplest)
+
+Every run **fully replaces** the partition it's responsible for. Great for batch/micro-batch pipelines partitioned by date.
+
+```python
+# Spark — overwrite only today's partition, leave others untouched
+(df_today
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("replaceWhere", "event_date = '2026-07-06'")
+    .save("/lakehouse/bronze/portal_events"))
+```
+
+✅ **Best for:** Bronze/Silver time-partitioned tables where each run owns a full partition.
+⚠️ **Watch out:** must set `replaceWhere` — otherwise you nuke the whole table.
+
+##### 2. MERGE / UPSERT (by primary key)
+
+Use a natural or surrogate key to **update if exists, insert if not.** Duplicates are impossible by construction.
+
+```sql
+MERGE INTO silver.orders t
+USING staging.orders s
+  ON t.order_id = s.order_id
+WHEN MATCHED AND s.updated_at > t.updated_at THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
+
+✅ **Best for:** dimension tables, SCD Type 1/2, CDC pipelines, Silver curated tables.
+⚠️ **Watch out:** MERGE is expensive at scale — needs a good `ON` predicate and often a partition/`ZORDER` on the key.
+
+##### 3. Deterministic keys (deduplication safety net)
+
+Every row gets a **deterministic ID** derived from its content (`hash(source + event_id + event_time)`). Any duplicate produces the same key, so a downstream `DISTINCT` or MERGE naturally deduplicates.
+
+```python
+from pyspark.sql.functions import sha2, concat_ws
+
+df_with_key = df.withColumn(
+    "row_key",
+    sha2(concat_ws("||", "source", "event_id", "event_time"), 256)
+)
+```
+
+✅ **Best for:** streaming or at-least-once ingestion where the source may replay events.
+⚠️ **Watch out:** the key must be **stable** — never include `now()` or the current run ID.
+
+##### 4. Transactional writes (all-or-nothing)
+
+The **write itself** must be atomic — either the whole batch commits or nothing does. Half-written state after a crash is the enemy of idempotency.
+
+- **Delta Lake / Iceberg / Hudi** — ACID commits via transaction log. A failed write leaves the table untouched.
+- **Warehouses** (Snowflake, BigQuery) — use `BEGIN … COMMIT` or MERGE inside a transaction.
+- **Object storage without ACID** (raw Parquet on ADLS/S3) — write to a temp path, then **atomic rename** on success.
+
+✅ **Best for:** any target that supports transactions — always prefer Delta/Iceberg over raw Parquet in Bronze/Silver/Gold.
+
+#### Common idempotency killers
+
+| Anti-pattern | Why it breaks | Fix |
+|---|---|---|
+| `INSERT INTO … SELECT …` on every run | Every retry appends duplicates | Use MERGE, or overwrite the partition |
+| `current_timestamp()` in the row key | Same input → different key on retry | Use event time or source-provided ID |
+| Auto-increment surrogate keys generated per run | Retries produce different keys for the same row | Generate keys deterministically from business key |
+| Appending to raw Parquet on ADLS | Failed write leaves partial files | Use Delta/Iceberg or write-then-rename |
+| Two jobs writing to the same target concurrently | Race conditions, lost updates | Use table-level locking (Delta) or single-writer discipline |
+| Reading `SELECT MAX(event_time)` from target to decide watermark | Retry uses wrong watermark | Persist watermark in a dedicated state table |
+
+#### Checklist — is your pipeline idempotent?
+
+Ask these five questions about **every** table your pipeline writes:
+
+1. If I re-run today's job **right now**, will the output be identical? ✅ / ❌
+2. If a run **crashes at 50%** and retries, are duplicates possible? ✅ / ❌
+3. If I **backfill last month**, will it corrupt anything downstream? ✅ / ❌
+4. If the **source replays** the same event twice, does my target dedupe? ✅ / ❌
+5. Is every write **atomic** (all-or-nothing)? ✅ / ❌
+
+If any answer is ❌, that's where the next production incident will come from.
+
+**One-line summary:** **Idempotent = safe to re-run.** Achieve it via **partition overwrite**, **MERGE on a key**, **deterministic row keys**, and **transactional writes** (Delta/Iceberg). Everything else is a duplicate waiting to happen.
+
+---
+
+### Backfills
+
+**Definition:** A **backfill** is re-running a pipeline for a **past date range** — either because the pipeline is new (needs history), the pipeline was broken for a few days, the source dropped late data, or a bug was fixed and past data must be recomputed.
+
+**Rule #1:** Backfills are only safe if the pipeline is **idempotent** (previous section). Without idempotency, a backfill *creates the very corruption* it was meant to fix.
+
+#### When you need a backfill
+
+| Scenario | Example |
+|---|---|
+| **New pipeline going live** | Load last 90 days of history into Bronze |
+| **Pipeline was broken** | Job failed silently for 3 days — re-run those 3 days |
+| **Bug fix** | Transform logic had an off-by-one; recompute the last 30 days |
+| **Late-arriving data** | Source finally sent data for last week — reprocess those partitions |
+| **Schema change** | New column added — populate historical rows |
+| **Source correction** | Upstream team restated 6 months of revenue — reprocess Silver + Gold |
+
+#### Two design philosophies
+
+There are two common ways to handle backfills. **Pick one and stick to it.**
+
+##### Option A — Same notebook, `backfill` parameter (recommended)
+
+The **same** Bronze / Silver / Gold notebook that runs daily can also run in backfill mode via a parameter. No separate pipeline, no duplicated code, no drift.
+
+**This is the approach used in our real pipeline.** Each layer's notebook accepts:
+
+| Parameter | Purpose |
+|---|---|
+| `backfill` | `true` / `false` — toggles backfill mode |
+| `start_date` | First date (inclusive) to reprocess |
+| `end_date` | Last date (inclusive) to reprocess |
+
+When `backfill=true`, the notebook **iterates over the date range** and reprocesses each partition through Bronze → Silver → Gold, using the **exact same transformation code** as the daily run.
+
+```python
+# Databricks / Fabric notebook — top of Bronze notebook
+dbutils.widgets.text("backfill", "false")
+dbutils.widgets.text("start_date", "")
+dbutils.widgets.text("end_date", "")
+dbutils.widgets.text("run_date", "")
+
+backfill    = dbutils.widgets.get("backfill").lower() == "true"
+run_date    = dbutils.widgets.get("run_date")
+start_date  = dbutils.widgets.get("start_date")
+end_date    = dbutils.widgets.get("end_date")
+
+# Build the list of dates to process
+if backfill:
+    dates = pd.date_range(start_date, end_date).strftime("%Y-%m-%d").tolist()
+else:
+    dates = [run_date or datetime.utcnow().strftime("%Y-%m-%d")]
+
+# Loop through each date — same logic for daily & backfill
+for d in dates:
+    print(f"Processing {d} …")
+    df = read_from_kusto(event_date=d)
+    (df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"event_date = '{d}'")   # idempotent!
+        .save("/lakehouse/bronze/portal_events"))
+```
+
+**Chaining across layers:** the orchestrator (ADF, Fabric Pipeline, Databricks Workflow) runs Bronze → Silver → Gold notebooks in sequence, passing the same `backfill`, `start_date`, `end_date` parameters to all three.
+
+**Why this pattern wins:**
+
+| Benefit | Why it matters |
+|---|---|
+| ✅ **Single codebase** | Daily logic and backfill logic can never drift |
+| ✅ **No extra pipeline to build** | Nothing new to deploy, monitor, or maintain |
+| ✅ **Same DQ checks apply** | Backfilled data goes through the exact same validation as daily runs |
+| ✅ **Cheap to trigger** | Just re-run the notebook with different widgets |
+| ✅ **Naturally idempotent** | Each date overwrites its own partition (`replaceWhere`) |
+| ✅ **Same lineage & observability** | Shows up in the same monitoring dashboards |
+
+##### Option B — Separate backfill pipeline
+
+A dedicated pipeline built only for backfills, with its own scheduler, cluster config, and orchestration. Common in older ETL platforms (Informatica, SSIS) where the daily pipeline can't easily accept parameters.
+
+**Downsides:** two codebases to maintain, easy to drift, extra deploy target, duplicated DQ checks, separate on-call ownership. **Avoid unless you have no choice.**
+
+#### Backfill design checklist
+
+Before kicking off a backfill, answer these:
+
+| # | Question | Why it matters |
+|---|---|---|
+| 1 | Is the pipeline **idempotent** for the date range being reprocessed? | Otherwise you'll create duplicates |
+| 2 | Are partitions **date-scoped** so we can overwrite one day at a time? | Enables safe, incremental replay |
+| 3 | Does the **source** still have data for the backfill range? | Kusto/APIs often expire raw data after 30–90 days |
+| 4 | Are we processing **serially or in parallel**? | Parallel is faster but multiplies cost & source load |
+| 5 | Will the backfill **overwhelm the source** (Kusto, API rate limits)? | Add throttling / smaller batches |
+| 6 | Will downstream consumers (BI, ML) **see partial data** mid-backfill? | Use a staging path or delayed publish |
+| 7 | Are we backfilling **all layers** or just some? | Bronze → Silver → Gold in order, or restart from wherever data broke |
+| 8 | How will we **verify** the backfill worked? | Row counts, DQ pass rate, spot-check known-good metrics |
+
+#### Serial vs. parallel backfill
+
+| Mode | How it runs | Pros | Cons |
+|---|---|---|---|
+| **Serial** (day-by-day) | Loop through dates one at a time | Predictable load, easy to debug, respects source rate limits | Slow — 90 days × 30 min/day = 45 hrs |
+| **Parallel** (fan-out) | Fire N days concurrently on separate cluster/tasks | Much faster, uses cluster capacity | Multiplies source load; hard to debug failures; concurrent-writer risk (must use per-partition `replaceWhere`) |
+
+**Rule of thumb:** start **serial**, switch to parallel only if the backfill volume demands it and the source can handle the concurrent load.
+
+#### Backfill anti-patterns
+
+| Anti-pattern | Fix |
+|---|---|
+| Deleting all data and reloading from scratch | Backfill only the affected date range |
+| Backfilling downstream (Gold) without redoing upstream (Silver) | Reprocess **top-down** — Bronze → Silver → Gold, in that order |
+| Running backfill on the same cluster as the daily job | Use a separate cluster/job pool so the daily SLA isn't impacted |
+| Skipping DQ checks "because it's backfill" | Backfilled data must pass the *same* DQ checks as fresh data |
+| Backfilling into the live table with no rollback plan | Write to a `_backfill_staging` path first, swap in atomically |
+| Forgetting to invalidate BI/cache/materialized views | Trigger downstream refresh after backfill completes |
+
+**One-line summary:** **A backfill is just a re-run over a past date range.** The cleanest pattern is a **single notebook with a `backfill` flag + `start_date`/`end_date` parameters** that loops over the range and overwrites each partition — the same code path as the daily run, made safe by **idempotency + partition overwrite**.
+
+---
+
+### Schema Evolution
+
+**Definition:** **Schema evolution** is how a pipeline **handles changes to the source or target schema over time** — new columns added, existing columns renamed, types changed, columns dropped — **without breaking downstream consumers.**
+
+**Reality check:** In every real system, the source *will* change. New telemetry fields get added, product teams rename attributes, a `string` becomes an `int`. If your pipeline halts every time a column appears, you have a fragile pipeline. If it silently drops the new column, you lose data. Schema evolution is how you handle this gracefully.
+
+#### The 5 types of schema changes
+
+Not all changes are equal — some are safe, some are dangerous.
+
+| # | Change | Safe? | Example |
+|---|---|---|---|
+| 1 | **Add a new column** | ✅ Safe (additive) | Source adds `user_agent` — old readers ignore it, new readers use it |
+| 2 | **Drop an existing column** | ⚠️ Breaking | Downstream queries referencing that column fail |
+| 3 | **Rename a column** | ⚠️ Breaking | `revenue` → `revenue_usd` — every consumer must update |
+| 4 | **Change a column type** | ⚠️ Breaking (widening = safer) | `int → bigint` = safe; `string → int` = unsafe (data may not parse) |
+| 5 | **Reorder columns** | ✅ Usually safe | Only breaks positional readers (CSV without header) |
+
+**Rule of thumb:** **Additive changes are safe. Destructive changes require a contract change + migration plan** (see Data Contracts in Step 5).
+
+#### How each file/table format handles evolution
+
+| Format | Add column | Drop column | Rename | Type change | Notes |
+|---|---|---|---|---|---|
+| **CSV** | ❌ Position breaks | ❌ | ❌ | ❌ | No schema — every change breaks |
+| **JSON** | ✅ | ⚠️ silent nulls | ❌ | ⚠️ | Flexible but no enforcement |
+| **Avro** | ✅ (with default) | ✅ (with default) | ✅ (via aliases) | ⚠️ widening only | **Built for evolution** — schema registry tracks versions |
+| **Parquet (raw)** | ⚠️ needs schema merge | ⚠️ | ❌ | ⚠️ | Schema is per-file — must merge on read |
+| **Delta Lake** | ✅ `mergeSchema` / `ALTER TABLE ADD COLUMN` | ✅ `ALTER TABLE DROP COLUMN` (column mapping) | ✅ `RENAME COLUMN` (column mapping) | ⚠️ requires overwrite for narrowing | **Best-in-class** — ACID + evolution in one commit |
+| **Iceberg** | ✅ | ✅ | ✅ | ⚠️ widening | Uses column **IDs**, not names — most robust for rename/reorder |
+
+#### The 4 strategies for handling schema drift
+
+##### 1. Reject (strict schema)
+
+The pipeline **fails fast** when the source schema doesn't match the expected schema.
+
+```python
+# Delta — strict write, no schema merge
+(df.write
+    .format("delta")
+    .mode("append")
+    .save("/lakehouse/silver/orders"))   # fails if df has new/missing columns
+```
+
+✅ **Best for:** Silver/Gold tables with strict business meaning, curated dimensions, financial data.
+⚠️ **Risk:** pipeline breaks on every additive source change.
+
+##### 2. Allow additive (schema merge)
+
+New columns are **auto-added** to the target; existing columns must still match. Dropped columns become `NULL` for new rows.
+
+```python
+# Delta — auto-merge new columns from the source
+(df.write
+    .format("delta")
+    .mode("append")
+    .option("mergeSchema", "true")       # add new columns automatically
+    .save("/lakehouse/bronze/portal_events"))
+```
+
+Or set once at the table level (Databricks):
+```sql
+ALTER TABLE bronze.portal_events SET TBLPROPERTIES ('delta.autoMerge.enabled' = 'true');
+```
+
+✅ **Best for:** Bronze — raw landing zone where source teams add new telemetry regularly.
+⚠️ **Risk:** silent addition can flood the table with junk columns; needs monitoring.
+
+##### 3. Overwrite schema (nuclear option)
+
+Completely replaces the table schema (and data) with the incoming DataFrame's schema.
+
+```python
+(df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save("/lakehouse/silver/orders"))
+```
+
+✅ **Best for:** rebuilds, schema migrations, backfills after a major structural change.
+⚠️ **Risk:** irreversible without a backup — always snapshot first.
+
+##### 4. Store as JSON / VARIANT (schema-on-read)
+
+Land the raw payload in a **flexible column** (JSON string or Databricks/Snowflake `VARIANT` type) and parse it downstream. New fields don't require any pipeline change.
+
+```python
+# Bronze — keep the raw JSON alongside parsed columns
+df_bronze = (df
+    .withColumn("raw_payload", to_json(struct("*")))
+    .select("event_id", "event_time", "event_date", "raw_payload"))
+```
+
+Downstream can `raw_payload:new_field::string` whenever the field appears.
+
+✅ **Best for:** highly volatile sources, event streams with hundreds of optional fields.
+⚠️ **Risk:** query cost is higher; loses column-level compression/pruning benefits.
+
+#### Schema evolution across the Medallion layers
+
+Each layer should adopt a **different strictness level**:
+
+| Layer | Strictness | Why |
+|---|---|---|
+| **Bronze** | **Lenient** — `mergeSchema=true`, or JSON/VARIANT column | Land everything the source sends; never lose data at the boundary |
+| **Silver** | **Moderate** — explicit `ALTER TABLE ADD COLUMN` reviewed via PR | Curated but flexible; business logic depends on stable columns |
+| **Gold** | **Strict** — schema changes require version bump + downstream comms | BI/ML consumers have hard dependencies on exact column names/types |
+
+#### Handling breaking changes — the versioning pattern
+
+When you *must* rename a column, drop one, or change a type, don't do it in place. Instead:
+
+1. **Add the new column** alongside the old one (both populated for a transition window).
+2. **Announce** the change to consumers with a deprecation date.
+3. **Monitor** which consumers still read the old column (query logs, lineage tools).
+4. **Drop the old column** only after consumers have migrated.
+
+Or version the table itself: `silver.orders_v1` → `silver.orders_v2`, with a view that points consumers to the current version.
+
+#### Schema evolution checklist
+
+Before merging code that changes the schema:
+
+| # | Question | If ❌ |
+|---|---|---|
+| 1 | Is the change **additive**? | Requires contract + migration plan |
+| 2 | Is the source change **documented** in the data contract? | Get producer to update contract first |
+| 3 | Does the change **preserve existing data**? | Backfill needed to recompute old rows |
+| 4 | Have you tested with **historical Bronze partitions**? | Test on 30 days of history before merging |
+| 5 | Have you notified **downstream consumers**? | Silent breakage incoming |
+| 6 | Does your **DQ suite** cover the new column? | Add null-check / range-check for it |
+| 7 | Does **BI / ML** rely on the changed column? | Coordinate the release |
+
+#### Common schema evolution anti-patterns
+
+| Anti-pattern | Fix |
+|---|---|
+| Renaming a column in place without warning consumers | Add new column → migrate consumers → drop old |
+| `mergeSchema=true` everywhere (including Silver/Gold) | Restrict to Bronze; enforce strictness downstream |
+| Storing everything as JSON to "avoid schema issues" | Loses compression, pruning, DQ; use only for truly volatile fields |
+| Changing types silently (`int → string`) | Add a v2 column with the new type; deprecate the v1 |
+| Not tracking schema history | Enable Delta / Iceberg schema history; log schema per commit |
+| Adding columns without updating the data contract | Update the contract first, then implement |
+
+**One-line summary:** **Schema evolution = handling source changes without breaking the pipeline.** Bronze should be **lenient** (`mergeSchema` or JSON payload), Silver/Gold should be **strict** (explicit `ALTER TABLE` via PR). For breaking changes, **add-then-remove with a deprecation window** — never rename or drop in place. Delta Lake and Iceberg make this cheap; CSV and raw Parquet make it painful.
+
+---
+
