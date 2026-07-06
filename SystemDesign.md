@@ -499,6 +499,8 @@ Take this sample `sales` table:
 | o_003 | theseniordev | 66.79 | Chennai | Electronics |
 | o_004 | theseniordev | 82.12 | Bengaluru | Clothes |
 | o_005 | theseniordev | 90.12 | Delhi | Clothes |
+![Storage & File Formats](Images/RowBased.png)
+![Storage & File Formats](Images/ColumnBased.png)
 
 #### Row-Based Storage
 
