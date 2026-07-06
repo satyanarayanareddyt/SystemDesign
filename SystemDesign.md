@@ -484,7 +484,126 @@ SCD patterns define **how changes to dimension attributes are tracked over time*
 
 ## Step 4 — Storage & File Formats
 
-*Coming next: Parquet, Avro, Delta Lake, Iceberg.*
+Once you know **what** data you're modeling (Step 3), the next question is **how it's physically stored on disk**. The single biggest decision here is **row-based vs. column-based** storage — it drives query speed, compression, and cost for every downstream workload.
+
+### Row-Based vs. Column-Based
+
+The difference is simply **how the bytes are laid out on disk**.
+
+Take this sample `sales` table:
+
+| order_id | name | revenue | city | category |
+|---|---|---|---|---|
+| o_001 | theseniordev | 49.99 | Bengaluru | Electronics |
+| o_002 | theseniordev | 128.94 | Bengaluru | Books |
+| o_003 | theseniordev | 66.79 | Chennai | Electronics |
+| o_004 | theseniordev | 82.12 | Bengaluru | Clothes |
+| o_005 | theseniordev | 90.12 | Delhi | Clothes |
+
+#### Row-Based Storage
+
+Each **row is stored contiguously** on disk — all columns of row 1, then all columns of row 2, and so on.
+
+```
+Row 1: o_001 | theseniordev | 49.99  | Bengaluru | Electronics
+Row 2: o_002 | theseniordev | 128.94 | Bengaluru | Books
+Row 3: o_003 | theseniordev | 66.79  | Chennai   | Electronics
+Row 4: o_004 | theseniordev | 82.12  | Bengaluru | Clothes
+Row 5: o_005 | theseniordev | 90.12  | Delhi     | Clothes
+```
+
+**Query:** `SELECT AVG(revenue) FROM sales WHERE city = 'Bengaluru'`
+
+The engine must **scan every row** — reading `order_id`, `name`, `revenue`, `city`, and `category` for each — even though the query only cares about **2 out of 5 columns**. This is wasteful I/O.
+
+✅ **Great for:** OLTP workloads — inserts, updates, deletes, and single-row lookups (e.g., "get me order o_003"). The whole row is in one place.
+❌ **Bad for:** Analytical queries that touch a few columns across millions of rows.
+
+#### Column-Based Storage
+
+Each **column is stored contiguously** on disk — all values of `order_id`, then all values of `name`, then all values of `revenue`, etc.
+
+```
+order_id : o_001 | o_002 | o_003 | o_004 | o_005
+name     : theseniordev | theseniordev | theseniordev | theseniordev | theseniordev
+revenue  : 49.99 | 128.94 | 66.79 | 82.12 | 90.12
+city     : Bengaluru | Bengaluru | Chennai | Bengaluru | Delhi
+category : Electronics | Books | Electronics | Clothes | Clothes
+```
+
+**Same query:** `SELECT AVG(revenue) FROM sales WHERE city = 'Bengaluru'`
+
+The engine reads **only the `city` and `revenue` columns** — skipping `order_id`, `name`, `category` entirely. On a 1 TB table with 50 columns, that's **~25× less I/O**.
+
+Bonus: since each column stores values of the **same data type**, compression is dramatically better (e.g., all cities compress together — "Bengaluru" appears 3× and can be dictionary-encoded to a single byte).
+
+✅ **Great for:** OLAP / analytical workloads — aggregations, filters, and column pruning across huge datasets.
+❌ **Bad for:** Single-row inserts/updates (you'd have to touch every column file).
+
+#### Row-Based vs. Column-Based — Trade-off
+
+| Dimension | **Row-Based** | **Column-Based** |
+|---|---|---|
+| Storage layout | Rows contiguous | Columns contiguous |
+| Best workload | **OLTP** (transactions, lookups) | **OLAP** (analytics, aggregations) |
+| Read pattern | Fetch full row fast | Fetch specific columns fast |
+| Compression | Poor (mixed data types per block) | **Excellent** (same type per block, dict/RLE encoding) |
+| Column pruning | ❌ Must read whole row | ✅ Skip unwanted columns entirely |
+| Predicate pushdown | Limited | ✅ Strong (min/max stats per column chunk) |
+| Insert/update speed | ✅ Fast (single row write) | Slower (touches every column) |
+| Aggregations (SUM, AVG) | Slow — scans everything | **Very fast** — reads only needed columns |
+| Vectorized execution | Limited | ✅ Native — SIMD on column arrays |
+| Storage size | Larger | ~3–10× smaller after compression |
+| Typical engines | PostgreSQL, MySQL, SQL Server, Oracle | Snowflake, BigQuery, Databricks, Redshift, DuckDB |
+| Best for | Application databases, order processing | Data lakes, warehouses, lakehouses, BI |
+
+### Example File Formats
+
+Every file format falls into one of three families based on how it lays out data.
+
+#### 1. Row-Based Formats
+
+| Format | Type | Notes |
+|---|---|---|
+| **CSV** | Plain text row | Human-readable, no schema, no compression, no types. Fine for tiny exports, terrible for analytics. |
+| **JSON / JSONL** | Semi-structured row | Nested, schema-flexible. Common for API responses, logs, telemetry. Verbose and slow to scan. |
+| **Avro** | Binary row + schema | Compact, schema-embedded, great for **streaming** (Kafka, Event Hub) and record-by-record writes. Splittable, supports schema evolution. Not ideal for analytical scans. |
+
+**When to use:** streaming ingestion, message queues, write-heavy workloads, raw event landing.
+
+#### 2. Column-Based Formats
+
+| Format | Type | Notes |
+|---|---|---|
+| **Parquet** | Columnar binary | **The industry standard** for analytics. Column pruning, predicate pushdown, dictionary + RLE + Snappy/Zstd compression, min/max stats per row group. Used by Spark, Databricks, Fabric, Snowflake, Athena, BigQuery, DuckDB. |
+| **ORC** | Columnar binary | Similar to Parquet but originated in the Hive ecosystem. Strong compression and built-in ACID support in Hive. Less common outside Hadoop. |
+
+**When to use:** analytical queries, BI dashboards, data lake storage, ML training data — anywhere you scan billions of rows across a handful of columns.
+
+#### 3. Table Formats (built *on top of* Parquet/ORC)
+
+These aren't file formats themselves — they're **transactional table formats** that add a metadata layer (JSON log + manifests) on top of Parquet files to provide ACID, time travel, schema evolution, and MERGE.
+
+| Format | Notes |
+|---|---|
+| **Delta Lake** | Open-source, Databricks-originated. ACID via `_delta_log/`. Native to Databricks, Fabric, and Synapse. Best MERGE performance. |
+| **Apache Iceberg** | Open-source, Netflix-originated. Vendor-neutral. Great for multi-engine access (Spark, Trino, Flink, Snowflake, BigQuery). Hidden partitioning. |
+| **Apache Hudi** | Open-source, Uber-originated. Optimized for **CDC and upserts** at scale (streaming writes, incremental pulls). |
+
+**When to use:** modern lakehouse. This is where **Bronze / Silver / Gold** tables live.
+
+#### Format Selection — Quick Rule of Thumb
+
+| Use case | Best format |
+|---|---|
+| Streaming ingestion (Kafka, Event Hub) | **Avro** |
+| API export / interop with other systems | **JSON** or **CSV** |
+| Raw event landing (Bronze) | **Delta / Iceberg** (Parquet under the hood) |
+| Curated analytics tables (Silver / Gold) | **Delta / Iceberg** |
+| Ad-hoc analytical files (no ACID needed) | **Parquet** |
+| OLTP application database | **Not a file format** — use PostgreSQL / SQL Server |
+
+**One-line summary:** **Row formats (CSV, JSON, Avro) optimize for writes and record-level access. Columnar formats (Parquet, ORC) optimize for analytical reads. Table formats (Delta, Iceberg, Hudi) add ACID and time travel on top of columnar files — this is what modern lakehouses use.**
 
 ---
 
