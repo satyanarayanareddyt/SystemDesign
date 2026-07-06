@@ -611,7 +611,41 @@ These aren't file formats themselves — they're **transactional table formats**
 
 ## Step 5 — Data Quality & Observability
 
-*Coming next: DQ Dimensions, Data Contracts, Pipeline Observability.*
+Observability answers: *"What is the pipeline doing right now, and what did it do yesterday?"* It's built on **three pillars** — the same as for microservices, adapted to data.
+
+| Pillar | For data pipelines, this means… |
+|---|---|
+| **Metrics** | Job duration, rows read/written, bytes shuffled, cluster utilization, retry counts, freshness lag |
+| **Logs** | Structured logs from each task — source, timestamp, correlation ID, error stack traces |
+| **Traces** | End-to-end lineage of a single run: source pull → Bronze write → Silver merge → Gold aggregation |
+
+**The five things every DE pipeline must emit:**
+
+1. **Run status** — success / failure / running / skipped, with start & end timestamps
+2. **Volume metrics** — rows in, rows out, rows rejected per step
+3. **Latency / freshness** — `now() - max(event_time)` for each layer
+4. **DQ results** — pass/fail counts per dimension, linked to run ID
+5. **Lineage** — which upstream tables/files fed this run, and which downstream tables depend on it
+
+**Alerting hierarchy (avoid alert fatigue):**
+
+| Severity | Trigger | Action |
+|---|---|---|
+| **P1 — Page on-call** | Prod job failed; freshness > 2× SLA; DQ hard-fail on critical table | Immediate pager |
+| **P2 — Email / ticket** | Retry succeeded; DQ warning; volume anomaly | Same-day investigation |
+| **P3 — Dashboard only** | Slow run (still within SLA); minor null-rate uptick | Weekly review |
+
+**What "good observability" looks like:**
+
+- Every run has a **unique run ID** carried through logs, metrics, and DQ results.
+- **Freshness lag** is visible on a single dashboard per table.
+- **Lineage** is auto-captured (Unity Catalog, Purview, OpenLineage, DataHub) — not maintained manually.
+- **Backfills and reruns** are distinguishable from scheduled runs.
+- **Alerts route to the owning team**, not a shared inbox.
+
+**Common tools:** Azure Monitor + Log Analytics, Databricks Job runs UI, Fabric Monitoring Hub, OpenLineage, Marquez, DataHub, Monte Carlo, Elementary (for dbt), Prometheus + Grafana.
+
+**One-line summary:** **DQ tells you if the data is right. Observability tells you if the pipeline is healthy. Data contracts prevent the two from breaking silently.**
 
 ---
 
